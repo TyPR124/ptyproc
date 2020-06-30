@@ -23,10 +23,11 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fmt,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Read, Write},
     mem::{align_of, size_of, size_of_val},
     os::windows::{
         ffi::OsStrExt,
+        io::AsRawHandle,
         process::ExitStatusExt,
     },
     path::Path,
@@ -35,8 +36,35 @@ use std::{
     time,
 };
 
+// Safety:
+// Manual Send and Sync is required
+// for pty_handle and proc_handle,
+// both of which use thread-safe APIs.
 unsafe impl Send for PtyProcess {}
+unsafe impl Sync for PtyProcess {}
 
+pub struct PtyProcess {
+    input_tx: pipe::Sender,
+    output_rx: pipe::Receiver,
+    pty_handle: HANDLE,
+    proc_handle: HANDLE,
+    drop_timeout: time::Duration,
+}
+
+// This struct is a copy of std's Command with unneeded items commented out
+pub struct Command {
+    program: OsString,
+    args: Vec<OsString>,
+    env: CommandEnv,
+    cwd: Option<OsString>,
+    // flags: u32,
+    // detach: bool,
+    // stdin: Option<Stdio>,
+    // stdout: Option<Stdio>,
+    // stderr: Option<Stdio>,
+}
+
+// Copy of std
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct EnvKey(OsString);
 
@@ -65,6 +93,7 @@ impl AsRef<OsStr> for EnvKey {
     }
 }
 
+// Copy of std
 #[derive(Clone, Debug)]
 struct CommandEnv {
     clear: bool,
@@ -97,22 +126,6 @@ impl CommandEnv {
         result
     }
 
-    // Apply these changes directly to the current environment
-    // pub fn apply(&self) {
-    //     if self.clear {
-    //         for (k, _) in env::vars_os() {
-    //             env::remove_var(k);
-    //         }
-    //     }
-    //     for (key, maybe_val) in self.vars.iter() {
-    //         if let Some(ref val) = maybe_val {
-    //             env::set_var(key, val);
-    //         } else {
-    //             env::remove_var(key);
-    //         }
-    //     }
-    // }
-
     pub fn is_unchanged(&self) -> bool {
         !self.clear && self.vars.is_empty()
     }
@@ -141,36 +154,11 @@ impl CommandEnv {
         self.vars.clear();
     }
 
-    // pub fn have_changed_path(&self) -> bool {
-    //     self.saw_path || self.clear
-    // }
-
     fn maybe_saw_path(&mut self, key: &OsStr) {
         if !self.saw_path && key == "PATH" {
             self.saw_path = true;
         }
     }
-}
-
-pub struct Command {
-    // This struct is a copy of std's Command with unneeded items commented out
-    program: OsString,
-    args: Vec<OsString>,
-    env: CommandEnv,
-    cwd: Option<OsString>,
-    // flags: u32,
-    // detach: bool,
-    // stdin: Option<Stdio>,
-    // stdout: Option<Stdio>,
-    // stderr: Option<Stdio>,
-}
-
-pub struct PtyProcess {
-    input_tx: Option<pipe::Sender>,
-    output_rx: Option<pipe::Receiver>,
-    pty_handle: HANDLE,
-    proc_handle: HANDLE,
-    drop_timeout: time::Duration,
 }
 
 impl Command {
@@ -207,10 +195,11 @@ impl Command {
         self.env.clear();
         self
     }
+    // Most of this fn body is copied from std, changes are specifically noted
     pub fn spawn_pty(&self) -> std::io::Result<PtyProcess> {
         let maybe_env = self.env.capture_if_changed();
         // To have the spawning semantics of unix/windows stay the same, we need
-        // to read the *child's* PATH if one is provided. See #15149 for more
+        // to read the *child's* PATH if one is provided. See Rust #15149 for more
         // details.
         let program = maybe_env.as_ref().and_then(|env| {
             if let Some(v) = env.get(OsStr::new("PATH")) {
@@ -228,9 +217,11 @@ impl Command {
             None
         });
 
+        // Initialize StartupInfo struct
         let mut si = STARTUPINFOEXW::default();
         si.StartupInfo.cb = size_of_val(&si) as u32;
         
+        // Create PTY (different from std)
         let (input_tx, input_rx) = pipe::unnamed()?;
         let (output_tx, output_rx) = pipe::unnamed()?;
         let size = COORD { X: 120, Y: 120 };
@@ -238,8 +229,8 @@ impl Command {
         let r = unsafe {
             CreatePseudoConsole(
                 size,
-                input_rx.as_raw_handle() as *mut VOID,
-                output_tx.as_raw_handle() as *mut VOID,
+                input_rx.as_raw_handle().cast(),
+                output_tx.as_raw_handle().cast(),
                 0,
                 &mut pty_handle,
             )
@@ -247,13 +238,12 @@ impl Command {
         if r != S_OK {
             Err(io::Error::from_raw_os_error(HRESULT_CODE(r)))?;
         }
-        // let mut boxed_tal = make_boxed_tal()?;
-        // fill_tal(&mut boxed_tal, pty_handle)?;
-        // si.lpAttributeList = boxed_tal.as_mut_ptr().cast();
+
+        // Attach PTY to StartupInfo (different from std)
         let (talp, _data) = make_talp(pty_handle)?;
         si.lpAttributeList = talp.cast();
         
-
+        // Validate / transform as needed: command line, environment, and wording directory
         let program = program.as_ref().unwrap_or(&self.program);
         let mut cmd_str = make_command_line(program, &self.args)?;
         cmd_str.push(0); // add null terminator
@@ -264,20 +254,22 @@ impl Command {
         let (dirp, _data) = make_dirp(self.cwd.as_ref())?;
         let mut pi = PROCESS_INFORMATION::default();
 
-        lazy_static::lazy_static! {
-            static ref CREATE_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        }
-        let _guard = CREATE_PROCESS_LOCK
-            .lock()
-            .expect("CREATE_PROCESS_LOCK error");
-
+        // In std's spawn, there is (effectively) a critical section around code that
+        // creates handles (for stdio) and calling CreateProcessW. This is used to
+        // prevent a possible race condition when spawning processes with inheritable
+        // handles. Here, we have no need for stdio handles since the whole point is
+        // to handle io via the pty instead. Therefore, we disable inheritance
+        // (bInheritHandles = FALSE) and do not require the extra synchronization.
+        
+        // Actually start the process
         let r = unsafe {
             CreateProcessW(
                 ptr::null_mut(), // app name (if null, taken from cmd_str)
                 cmd_str.as_mut_ptr(),
                 ptr::null_mut(), // proc attr
                 ptr::null_mut(), // thread attr
-                0,               // Inherit handles bool,
+                // bInheritHandles: if we ever need to set this to TRUE, be wary of race conditions!
+                0,
                 flags,
                 envp,
                 dirp,
@@ -290,15 +282,14 @@ impl Command {
             Err(io::Error::last_os_error())?;
         }
 
-        drop(_guard);
+        // No reason to keep the new process's thread handle around
         unsafe { CloseHandle(pi.hThread) };
-        let proc_handle = pi.hProcess;
 
         Ok(PtyProcess {
-            output_rx: Some(output_rx),
-            input_tx: Some(input_tx),
+            output_rx,
+            input_tx,
             pty_handle,
-            proc_handle,
+            proc_handle: pi.hProcess,
             drop_timeout: time::Duration::from_secs(0),
         })
     }
@@ -345,33 +336,73 @@ impl PtyProcess {
         }
         Ok(Some(ExitStatus::from_raw(status)))
     }
-    pub fn take_reader(&mut self) -> Option<pipe::Receiver> {
-        self.output_rx.take()
+    pub fn try_clone_reader(&self) -> std::io::Result<pipe::Receiver> {
+        self.output_rx.try_clone()
     }
-    pub fn take_writer(&mut self) -> Option<pipe::Sender> {
-        self.input_tx.take()
+    pub fn try_clone_writer(&self) -> std::io::Result<pipe::Sender> {
+        self.input_tx.try_clone()
     }
     pub fn set_drop_timeout(&mut self, timeout: time::Duration) {
         self.drop_timeout = timeout;
     }
 }
 
+impl Read for &PtyProcess {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.output_rx).read(buf)
+    }
+}
+
+impl Write for &PtyProcess {
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.input_tx).flush()
+    }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.input_tx).write(buf)
+    }
+}
+
+impl Read for PtyProcess {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+impl Write for PtyProcess {
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self).flush()
+    }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self).write(buf)
+    }
+}
+
 impl Drop for PtyProcess {
     fn drop(&mut self) {
-        drop(self.kill());
+        // Wait for drop timeout for process to end itself, then kill it
+        match self.try_wait_timeout(self.drop_timeout) {
+            Ok(Some(_)) => {}, // Process exited on its own
+            _ => {
+                let r = self.kill();
+                debug_assert!(r.is_ok(), "failed to kill process in PtyProcess drop");
+            }
+        }
+        // Close our process and pty handles.
+        // Note: any outstanding pipe objedts are dropped separately.
         let res = unsafe { CloseHandle(self.proc_handle) };
         debug_assert_ne!(0, res, "failed to close process handle in PtyProcess drop");
-        self.take_writer().map(drop);
-        self.take_reader().map(drop);
+        // ClosePseudoConsole has no return value
         unsafe { ClosePseudoConsole(self.pty_handle) };
     }
 }
 
+// TAL_BUF_UNIT: Unit used for allocating a Thread Attribute List buffer. Ensures we get proper alignment.
 #[allow(non_camel_case_types)]
 type TAL_BUF_UNIT = u64;
 static_assertions::const_assert!(align_of::<TAL_BUF_UNIT>() >= align_of::<PROC_THREAD_ATTRIBUTE_LIST>());
 const TAL_BUF_UNIT_SIZE: usize = size_of::<TAL_BUF_UNIT>();
 
+// Not in std - creates and initializes a thread attribute list, returning a raw pointer to the buffer and the owned buffer
 fn make_talp(pty: HANDLE) -> io::Result<(*mut VOID, Box<[TAL_BUF_UNIT]>)> {
     let mut tal_size_bytes = 0;
     // No need to check return value, call will fail but fill in tal_size value.
@@ -415,6 +446,7 @@ fn make_talp(pty: HANDLE) -> io::Result<(*mut VOID, Box<[TAL_BUF_UNIT]>)> {
     Ok((tal_buf.as_mut_ptr().cast(), tal_buf))
 }
 
+// Copy of std
 fn ensure_no_nuls<T: AsRef<OsStr>>(str: T) -> io::Result<T> {
     if str.as_ref().encode_wide().any(|b| b == 0) {
         Err(io::Error::new(ErrorKind::InvalidInput, "nul byte found in provided data"))
@@ -423,6 +455,7 @@ fn ensure_no_nuls<T: AsRef<OsStr>>(str: T) -> io::Result<T> {
     }
 }
 
+// Copy of std
 // Produces a wide string *without terminating null*; returns an error if
 // `prog` or any of the `args` contain a nul.
 fn make_command_line(prog: &OsStr, args: &[OsString]) -> io::Result<Vec<u16>> {
@@ -480,7 +513,7 @@ fn make_command_line(prog: &OsStr, args: &[OsString]) -> io::Result<Vec<u16>> {
     }
 }
 
-
+// Copy of std
 fn make_envp(maybe_env: Option<BTreeMap<EnvKey, OsString>>) -> io::Result<(*mut VOID, Vec<u16>)> {
     // On Windows we pass an "environment block" which is not a char**, but
     // rather a concatenation of null-terminated k=v\0 sequences, with a final
@@ -501,6 +534,7 @@ fn make_envp(maybe_env: Option<BTreeMap<EnvKey, OsString>>) -> io::Result<(*mut 
     }
 }
 
+// Copy of std
 fn make_dirp(d: Option<&OsString>) -> io::Result<(*const u16, Vec<u16>)> {
     match d {
         Some(dir) => {
@@ -522,30 +556,19 @@ impl fmt::Debug for Command {
     }
 }
 
-#[test]
-fn test_shortlived() {
-    use crate::Command;
-    let _p = Command::new("ping").args(&["-n", "1", "127.0.0.1"]).spawn_pty().unwrap();
-    #[allow(deprecated)]
-    std::thread::sleep_ms(3000);
-}
-#[test]
-fn long_running_early_drop() {
-    use crate::Command;
-    let _p = Command::new("ping").args(&["-t", "127.0.0.1"]).spawn_pty().unwrap();
-    #[allow(deprecated)]
-    std::thread::sleep_ms(3000);
-}
-#[test]
-fn drop_immediately() {
-    use crate::Command;
-    drop(Command::new("ping").args(&["-t", "127.0.0.1"]).spawn_pty().unwrap());
-}
-#[test]
-fn drop_after_io_taken() {
-    use crate::Command;
-    let mut p = Command::new("ping").args(&["-t", "127.0.0.1"]).spawn_pty().unwrap();
-    let _r = p.take_reader().unwrap();
-    let _w = p.take_writer().unwrap();
-    drop(p);
-}
+// Testing drop by checking PID seems not ideal since the system could
+// create another process with the same PID as the old one.
+// #[test]
+// fn drop_test() {
+//     let p = crate::Command::new("cmd").spawn_pty().unwrap();
+//     let pid = p.id();
+//     use winapi::um::processthreadsapi::GetProcessVersion;
+//     let r = unsafe { GetProcessVersion(pid) };
+//     assert_ne!(0, r);
+//     drop(p);
+//     let r = unsafe { GetProcessVersion(pid) };
+//     assert_eq!(0, r);
+//     let err = std::io::Error::last_os_error();
+//     // The following: only once https://github.com/rust-lang/rust/pull/73752 is merged
+//     // assert_eq!(std::io::ErrorKind::InvalidInput, err.kind());
+// }

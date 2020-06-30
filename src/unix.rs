@@ -1,22 +1,26 @@
 use std;
 use std::fs::File;
 use std::process::{Command, ExitStatus};
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::os::unix::io::{FromRawFd, AsRawFd};
-use std::{thread, time};
-use nix::pty::{posix_openpt, grantpt, unlockpt, PtyMaster};
+use std::time;
+use nix::pty::{posix_openpt, grantpt, unlockpt};
 use nix::fcntl::{OFlag, open};
 use nix::sys::{stat, termios};
-use nix::unistd::{fork, ForkResult, setsid, dup, dup2, Pid};
+use nix::unistd::{fork, ForkResult, setsid, dup2, Pid};
 use nix::libc::{STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
 pub use nix::sys::{wait, signal::{self, Signal}};
 
 pub struct PtyProcess {
-    pty: PtyMaster,
+    pty: File,
     pid: Pid,
     status: Option<ExitStatus>,
     drop_timeout: time::Duration,
+}
+
+pub trait PtyProcessExt {
+    fn signal(&mut self, signal: impl Into<Option<Signal>>) -> nix::Result<()>;
 }
 
 #[cfg(target_os = "linux")]
@@ -63,6 +67,15 @@ fn spawn_pty(cmd: &mut Command) -> nix::Result<PtyProcess> {
     // on Linux this is the libc function, on OSX this is our implementation of ptsname_r
     let slave_name = ptsname_r(&master_fd)?;
 
+    // The master_fd is more useful as a File. This fd is closed in same
+    // way as any other fd, so we must effectively move the fd into a File
+    // object without dropping (closing) the fd
+    let pty = {
+        let fd = master_fd.as_raw_fd();
+        std::mem::forget(master_fd);
+        unsafe { File::from_raw_fd(fd) }
+    };
+
     match fork()? {
         ForkResult::Child => {
             // create new session with child as session leader
@@ -86,7 +99,7 @@ fn spawn_pty(cmd: &mut Command) -> nix::Result<PtyProcess> {
         },
         ForkResult::Parent { child: pid } => {
             Ok(PtyProcess {
-                pty: master_fd,
+                pty,
                 pid,
                 status: None,
                 drop_timeout: time::Duration::from_secs(0),
@@ -155,31 +168,72 @@ impl PtyProcess {
             }
         }
     }
-    pub fn take_reader(&mut self) -> Option<File> {
-        let fd = dup(self.pty.as_raw_fd()).unwrap();
-        let file = unsafe { File::from_raw_fd(fd) };
-        Some(file)
+    pub fn try_clone_reader(&self) -> std::io::Result<File> {
+        self.pty.try_clone()
     }
-    pub fn take_writer(&mut self) -> Option<File> {
-        let fd = dup(self.pty.as_raw_fd()).unwrap();
-        let file = unsafe { File::from_raw_fd(fd) };
-        Some(file)
+    pub fn try_clone_writer(&self) -> std::io::Result<File> {
+        self.pty.try_clone()
     }
     pub fn set_drop_timeout(&mut self, timeout: time::Duration) {
         self.drop_timeout = timeout;
+    }
+    pub fn signal(&mut self, signal: impl Into<Option<Signal>>) -> nix::Result<()> {
+        if self.status.is_some() {
+            // Process has already exited
+            Err(nix::Error::invalid_argument())
+        } else {
+            signal::kill(self.pid, signal)
+        }
+    }
+}
+
+impl Read for &PtyProcess {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.pty).read(buf)
+    }
+}
+
+impl Read for PtyProcess {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+impl Write for &PtyProcess {
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.pty).flush()
+    }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.pty).write(buf)
+    }
+}
+
+impl Write for PtyProcess {
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self).flush()
+    }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self).write(buf)
     }
 }
 
 impl Drop for PtyProcess {
     fn drop(&mut self) {
         // Per docs on crate::PtyProcess::set_drop_timeout - send SIGTERM, wait for timeout, then SIGKILL
-        if let Ok(None) = self.try_wait() {
-            drop(signal::kill(self.pid, signal::Signal::SIGTERM));
-            if let Ok(None) = self.try_wait_timeout(self.drop_timeout) {
-                let res = self.kill();
-                debug_assert!(res.is_ok(), "failed to kill PtyProcess");
-                let res = self.wait();
-                debug_assert!(res.is_ok(), "failed to cleanup PtyProcess");
+        match self.try_wait() {
+            Ok(Some(_)) => {}, // Process has ended
+            _ => {
+                let res = signal::kill(self.pid, signal::Signal::SIGTERM);
+                debug_assert!(res.is_ok(), "failed to send SIGTERM");
+                match self.try_wait_timeout(self.drop_timeout) {
+                    Ok(Some(_)) => {}, // Process has ended
+                    _ => {
+                        let res = self.kill();
+                        debug_assert!(res.is_ok(), "failed to kill PtyProcess");
+                        let res = self.wait();
+                        debug_assert!(res.is_ok());
+                    }
+                }
             }
         }
     }
