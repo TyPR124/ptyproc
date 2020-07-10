@@ -155,12 +155,12 @@ impl PtyProcess {
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         self.inner.wait()
     }
-    /// Attempt to clone the PtyReader from this process.
+    /// Get a reference to the reader for this process.
     pub fn reader(&self) -> &PtyReader {
         self.inner.reader()
     }
-    /// Attempt to clone the PtyWriter from this process.
-    pub fn try_clone_writer(&self) -> &PtyWriter {
+    /// Get a reference to the writer for this process.
+    pub fn writer(&self) -> &PtyWriter {
         self.inner.writer()
     }
 
