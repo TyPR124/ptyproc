@@ -44,8 +44,8 @@ unsafe impl Send for PtyProcess {}
 unsafe impl Sync for PtyProcess {}
 
 pub struct PtyProcess {
-    input_tx: pipe::Sender,
-    output_rx: pipe::Receiver,
+    input_tx: crate::PtyWriter,
+    output_rx: crate::PtyReader,
     pty_handle: HANDLE,
     proc_handle: HANDLE,
     drop_timeout: time::Duration,
@@ -286,8 +286,8 @@ impl Command {
         unsafe { CloseHandle(pi.hThread) };
 
         Ok(PtyProcess {
-            output_rx,
-            input_tx,
+            output_rx: crate::PtyReader::from_inner(output_rx),
+            input_tx: crate::PtyWriter::from_inner(input_tx),
             pty_handle,
             proc_handle: pi.hProcess,
             drop_timeout: time::Duration::from_secs(0),
@@ -336,11 +336,11 @@ impl PtyProcess {
         }
         Ok(Some(ExitStatus::from_raw(status)))
     }
-    pub fn try_clone_reader(&self) -> std::io::Result<pipe::Receiver> {
-        self.output_rx.try_clone()
+    pub fn reader(&self) -> &crate::PtyReader {
+        &self.output_rx
     }
-    pub fn try_clone_writer(&self) -> std::io::Result<pipe::Sender> {
-        self.input_tx.try_clone()
+    pub fn writer(&self) -> &crate::PtyWriter {
+        &self.input_tx
     }
     pub fn set_drop_timeout(&mut self, timeout: time::Duration) {
         self.drop_timeout = timeout;
@@ -349,16 +349,16 @@ impl PtyProcess {
 
 impl Read for &PtyProcess {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        (&self.output_rx).read(buf)
+        self.reader().read(buf)
     }
 }
 
 impl Write for &PtyProcess {
     fn flush(&mut self) -> std::io::Result<()> {
-        (&self.input_tx).flush()
+        self.writer().flush()
     }
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        (&self.input_tx).write(buf)
+        self.writer().write(buf)
     }
 }
 

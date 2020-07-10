@@ -8,12 +8,17 @@ use std::time;
 use nix::pty::{posix_openpt, grantpt, unlockpt};
 use nix::fcntl::{OFlag, open};
 use nix::sys::{stat, termios};
-use nix::unistd::{fork, ForkResult, setsid, dup2, Pid};
+use nix::unistd::{fork, ForkResult, setsid, dup, dup2, Pid};
 use nix::libc::{STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
 pub use nix::sys::{wait, signal::{self, Signal}};
 
 pub struct PtyProcess {
-    pty: File,
+    // reader and writer are both the same File object.
+    // keeping them separate here allows us to avoid
+    // a bit of unsafe code to make the PtyProcess::reader() and ::writer()
+    // APIs work
+    reader: crate::PtyReader,
+    writer: crate::PtyWriter,
     pid: Pid,
     status: Option<ExitStatus>,
     drop_timeout: time::Duration,
@@ -69,11 +74,13 @@ fn spawn_pty(cmd: &mut Command) -> nix::Result<PtyProcess> {
 
     // The master_fd is more useful as a File. This fd is closed in same
     // way as any other fd, so we must effectively move the fd into a File
-    // object without dropping (closing) the fd
-    let pty = {
-        let fd = master_fd.as_raw_fd();
+    // object without dropping (closing) the fd. Dup the fd for a reader and writer
+    // pair.
+    let (reader, writer) = {
+        let fd1 = master_fd.as_raw_fd();
         std::mem::forget(master_fd);
-        unsafe { File::from_raw_fd(fd) }
+        let fd2 = dup(fd1)?;
+        unsafe { (File::from_raw_fd(fd1), File::from_raw_fd(fd2)) }
     };
 
     match fork()? {
@@ -99,7 +106,8 @@ fn spawn_pty(cmd: &mut Command) -> nix::Result<PtyProcess> {
         },
         ForkResult::Parent { child: pid } => {
             Ok(PtyProcess {
-                pty,
+                reader: crate::PtyReader::from_inner(reader),
+                writer: crate::PtyWriter::from_inner(writer),
                 pid,
                 status: None,
                 drop_timeout: time::Duration::from_secs(0),
@@ -168,11 +176,11 @@ impl PtyProcess {
             }
         }
     }
-    pub fn try_clone_reader(&self) -> std::io::Result<File> {
-        self.pty.try_clone()
+    pub fn reader(&self) -> &crate::PtyReader {
+        &self.reader
     }
-    pub fn try_clone_writer(&self) -> std::io::Result<File> {
-        self.pty.try_clone()
+    pub fn writer(&self) -> &crate::PtyWriter {
+        &self.writer
     }
     pub fn set_drop_timeout(&mut self, timeout: time::Duration) {
         self.drop_timeout = timeout;
@@ -189,7 +197,7 @@ impl PtyProcess {
 
 impl Read for &PtyProcess {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        (&self.pty).read(buf)
+        self.reader().read(buf)
     }
 }
 
@@ -201,10 +209,10 @@ impl Read for PtyProcess {
 
 impl Write for &PtyProcess {
     fn flush(&mut self) -> std::io::Result<()> {
-        (&self.pty).flush()
+        self.writer().flush()
     }
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        (&self.pty).write(buf)
+        self.writer().write(buf)
     }
 }
 

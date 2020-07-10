@@ -156,12 +156,12 @@ impl PtyProcess {
         self.inner.wait()
     }
     /// Attempt to clone the PtyReader from this process.
-    pub fn try_clone_reader(&self) -> std::io::Result<PtyReader> {
-        self.inner.try_clone_reader().map(PtyReader::from_inner)
+    pub fn reader(&self) -> &PtyReader {
+        self.inner.reader()
     }
     /// Attempt to clone the PtyWriter from this process.
-    pub fn try_clone_writer(&self) -> std::io::Result<PtyWriter> {
-        self.inner.try_clone_writer().map(PtyWriter::from_inner)
+    pub fn try_clone_writer(&self) -> &PtyWriter {
+        self.inner.writer()
     }
 
     /// Setting this value changes the behavior of dropping the PtyProcess. The default timeout value is 0.
@@ -212,7 +212,7 @@ pub struct PtyReader {
 }
 
 impl PtyReader {
-    fn from_inner(inner: InnerPtyReader) -> Self {
+    pub(crate) fn from_inner(inner: InnerPtyReader) -> Self {
         Self {
             inner,
         }
@@ -220,6 +220,13 @@ impl PtyReader {
     pub fn try_clone(&self) -> std::io::Result<Self> {
         let cloned = self.inner.try_clone()?;
         Ok(Self::from_inner(cloned))
+    }
+}
+
+impl Read for &PtyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut reader = &self.inner;
+        reader.read(buf)
     }
 }
 
@@ -228,12 +235,13 @@ impl Read for PtyReader {
         self.inner.read(buf)
     }
 }
+
 pub struct PtyWriter {
     inner: InnerPtyWriter,
 }
 
 impl PtyWriter {
-    fn from_inner(inner: InnerPtyWriter) -> Self {
+    pub(crate) fn from_inner(inner: InnerPtyWriter) -> Self {
         Self {
             inner,
         }
@@ -241,6 +249,17 @@ impl PtyWriter {
     pub fn try_clone(&self) -> std::io::Result<Self> {
         let cloned = self.inner.try_clone()?;
         Ok(Self::from_inner(cloned))
+    }
+}
+
+impl Write for &PtyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut writer = &self.inner;
+        writer.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut writer = &self.inner;
+        writer.flush()
     }
 }
 
