@@ -16,4 +16,6 @@ nix = "0.17.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.8", features = ["consoleapi", "fileapi", "handleapi", "impl-default", "namedpipeapi", "processthreadsapi", "synchapi", "winbase", "winerror", "winnt"] }
-lazy_static = "1.4.0"
+
+[dev-dependencies]
+tempfile = "3"
